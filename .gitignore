@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+*.xlsx
+*.xls
+输出报告/
+.DS_Store

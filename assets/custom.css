@@ -1,0 +1,22 @@
+/* Custom styles for keyword analyzer dashboard */
+.dash-table-container {
+    margin-top: 10px;
+}
+
+.dash-spreadsheet-container .dash-spreadsheet-inner th {
+    white-space: nowrap;
+}
+
+.card {
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border: none;
+}
+
+.card-header {
+    background-color: #f8f9fa;
+    border-bottom: 2px solid #dee2e6;
+}
+
+.nav-link.active {
+    font-weight: bold !important;
+}
