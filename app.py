@@ -13,6 +13,8 @@ import dash
 from dash import html, dcc, dash_table, Input, Output, State, callback, ctx
 import dash_bootstrap_components as dbc
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 
 # ── Supabase 配置 ─────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get(
@@ -277,13 +279,22 @@ def _render_datatable(df, header_color="#2C3E50", page_size=30, freeze_cols=0):
     )
 
 
-def _build_mode2_tabs(results_dict):
+def _build_mode2_tabs(results_dict, full_results=None):
     """
     从 results_dict {tab_name: DataFrame} 构建模式2 Tab 列表。
     tab_order 固定为 4 个标签页。
     """
-    tab_order = ["费比总览", "Campaign明细", "关键词ROI分析", "建议否定词"]
     tabs = []
+
+    # Dashboard tab (first!)
+    if full_results:
+        dashboard_content = _build_dashboard_section(full_results)
+        tabs.append(dbc.Tab(
+            label="📊 总览仪表盘",
+            children=[dashboard_content],
+        ))
+
+    tab_order = ["费比总览", "Campaign明细", "关键词ROI分析", "建议否定词"]
     for label in tab_order:
         df = results_dict.get(label)
         if df is not None and not df.empty:
@@ -299,6 +310,268 @@ def _build_mode2_tabs(results_dict):
                 children=[html.P("无数据", className="text-muted p-4")],
             ))
     return tabs
+
+
+def _build_dashboard_section(results):
+    """Build the comprehensive dashboard overview section."""
+    dashboard = results.get("dashboard", {})
+    priority_df = results.get("priority")
+    pl_df = results.get("pl_suggestions")
+
+    if not dashboard:
+        return html.Div()
+
+    sections = []
+
+    # ── Section 1: KPI Cards ──
+    metrics = dashboard.get("metrics", {})
+    total_spend = metrics.get("total_spend", 0)
+    total_sales = metrics.get("total_sales", 0)
+    overall_acos = metrics.get("overall_acos", 0)
+    total_orders = metrics.get("total_orders", 0)
+    target_acos = metrics.get("target_acos", 0.04)
+    acos_ok = overall_acos <= target_acos if overall_acos > 0 else True
+
+    kpi_cards = dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.H6("总花费", className="text-muted"),
+                html.H3(f"€{total_spend:,.0f}", style={"color": "#2C3E50"}),
+            ])
+        ], className="text-center"), md=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.H6("广告销售额", className="text-muted"),
+                html.H3(f"€{total_sales:,.0f}", style={"color": "#27ae60"}),
+            ])
+        ], className="text-center"), md=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.H6("综合ACoS", className="text-muted"),
+                html.H3(f"{overall_acos*100:.1f}%",
+                        style={"color": "#27ae60" if acos_ok else "#e74c3c"}),
+                html.Small(f"目标: {target_acos*100:.1f}% {'✅' if acos_ok else '❌'}")
+            ])
+        ], className="text-center"), md=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.H6("总订单", className="text-muted"),
+                html.H3(f"{total_orders:,}", style={"color": "#2C3E50"}),
+            ])
+        ], className="text-center"), md=3),
+    ], className="mb-3")
+    sections.append(kpi_cards)
+
+    # ── Section 2: Budget & Sales Progress (if budget_config provided) ──
+    budget = dashboard.get("budget", {})
+    prediction = dashboard.get("prediction", {})
+
+    if budget.get("monthly_budget"):
+        budget_pct = budget.get("budget_spent_pct", 0)
+        sales_pct = budget.get("sales_completed_pct", 0)
+
+        progress_section = dbc.Card([
+            dbc.CardHeader(html.H5("📊 月度目标进度", className="mb-0")),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.H6(f"广告预算: €{budget.get('monthly_budget',0):,.0f}"),
+                        dbc.Progress(
+                            value=min(budget_pct * 100, 100),
+                            label=f"{budget_pct*100:.1f}%",
+                            color="danger" if budget_pct > 0.9 else ("warning" if budget_pct > 0.7 else "success"),
+                            className="mb-2", style={"height": "25px"}
+                        ),
+                        html.Small(f"已花费 €{total_spend:,.0f} | 剩余 €{budget.get('budget_remaining',0):,.0f}"),
+                    ], md=6),
+                    dbc.Col([
+                        html.H6(f"销量目标: €{budget.get('monthly_sales_target',0):,.0f}"),
+                        dbc.Progress(
+                            value=min(sales_pct * 100, 100),
+                            label=f"{sales_pct*100:.1f}%",
+                            color="success" if sales_pct > 0.8 else ("warning" if sales_pct > 0.5 else "danger"),
+                            className="mb-2", style={"height": "25px"}
+                        ),
+                        html.Small(f"已完成 €{total_sales:,.0f} | 缺口 €{budget.get('sales_remaining',0):,.0f}"),
+                    ], md=6),
+                ]),
+                # Prediction section
+                html.Hr(),
+                dbc.Row([
+                    dbc.Col([
+                        html.H6("📈 月底预测"),
+                        html.P([
+                            f"按当前速度，预计月底花费 ",
+                            html.B(f"€{prediction.get('predicted_month_end_spend', 0):,.0f}"),
+                            " | 预计销售额 ",
+                            html.B(f"€{prediction.get('predicted_month_end_sales', 0):,.0f}"),
+                        ]),
+                        html.P([
+                            "预算状态: ",
+                            html.Span("⚠️ 将超预算" if prediction.get("will_overspend") else "✅ 预算充足",
+                                     style={"color": "#e74c3c" if prediction.get("will_overspend") else "#27ae60", "fontWeight":"bold"}),
+                            " | 销量状态: ",
+                            html.Span("✅ 预计达标" if prediction.get("will_meet_target") else "❌ 预计未达标",
+                                     style={"color": "#27ae60" if prediction.get("will_meet_target") else "#e74c3c", "fontWeight":"bold"}),
+                        ]),
+                    ], md=6),
+                    dbc.Col([
+                        html.H6("🎯 每日建议目标"),
+                        html.P(f"建议每日花费: €{budget.get('daily_budget_needed', 0):,.0f}"),
+                        html.P(f"建议每日销售: €{budget.get('daily_sales_needed', 0):,.0f}"),
+                    ], md=6),
+                ]),
+            ]),
+        ], className="mb-3")
+        sections.append(progress_section)
+
+    # ── Section 3: Alerts ──
+    alerts = dashboard.get("alerts", [])
+    if alerts:
+        alert_items = []
+        for a in alerts[:10]:
+            alert_items.append(html.Li([
+                html.B(f"{a.get('品线','')} — {a.get('ASIN','')}"),
+                f"  ACoS {a.get('acos',0)*100:.1f}%，花费 €{a.get('spend',0):,.0f}，销售额 €{a.get('sales',0):,.0f}",
+            ]))
+        sections.append(dbc.Alert([
+            html.H5("🚨 异常警报：高ACoS产品（>15%）", className="alert-heading"),
+            html.Ul(alert_items),
+        ], color="danger", className="mb-3"))
+
+    # ── Section 4: Priority Classification ──
+    if priority_df is not None and not priority_df.empty:
+        # Summary counts
+        pri_counts = priority_df["优先级"].value_counts().to_dict()
+
+        pri_summary = dbc.Row([
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4(pri_counts.get("🔴 紧急处理", 0), style={"color":"#e74c3c"}),
+                html.Small("紧急处理")
+            ]), className="text-center border-danger"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4(pri_counts.get("🟡 观察调整", 0), style={"color":"#f39c12"}),
+                html.Small("观察调整")
+            ]), className="text-center border-warning"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4(pri_counts.get("🟢 增加投入", 0), style={"color":"#27ae60"}),
+                html.Small("增加投入")
+            ]), className="text-center border-success"), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H4(pri_counts.get("⚪ 低优先级", 0), style={"color":"#95a5a6"}),
+                html.Small("低优先级")
+            ]), className="text-center"), md=3),
+        ], className="mb-3")
+        sections.append(html.H5("🚦 产品优先级分类", className="mt-3 mb-2"))
+        sections.append(pri_summary)
+
+        # Priority table
+        pri_formatted = _format_df_columns(priority_df.copy(), mode="mode2")
+        sections.append(_render_datatable(pri_formatted, header_color="#2C3E50"))
+
+    # ── Section 5: Product Line Suggestions ──
+    if pl_df is not None and not pl_df.empty:
+        sections.append(html.H5("📋 品线优化建议", className="mt-4 mb-2"))
+        pl_formatted = _format_df_columns(pl_df.copy(), mode="mode2")
+        sections.append(_render_datatable(pl_formatted, header_color="#2C3E50"))
+
+    # ── Section 6: Charts ──
+    charts = []
+
+    def _to_float(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).replace("%","").replace("€","").replace(",","").strip()
+        try:
+            return float(s)
+        except Exception:
+            return 0
+
+    # Chart 1: ACoS vs Target bar chart (per ASIN)
+    if priority_df is not None and not priority_df.empty:
+        chart_df = priority_df[priority_df["ASIN"] != ""].head(20)
+        if not chart_df.empty and "综合ACoS" in chart_df.columns and "目标ACoS" in chart_df.columns:
+            _acos_vals = chart_df["综合ACoS"].apply(_to_float)
+            _target_vals = chart_df["目标ACoS"].apply(_to_float)
+            _labels = chart_df["ASIN"].astype(str)
+
+            fig_acos = go.Figure()
+            fig_acos.add_trace(go.Bar(
+                x=_labels, y=_acos_vals, name="实际ACoS",
+                marker_color=["#e74c3c" if a > t else "#27ae60" for a, t in zip(_acos_vals, _target_vals)],
+            ))
+            fig_acos.add_trace(go.Scatter(
+                x=_labels, y=_target_vals, name="目标ACoS",
+                mode="markers+lines", line=dict(color="#f39c12", dash="dash"),
+            ))
+            fig_acos.update_layout(
+                title="ASIN ACoS vs 目标ACoS", height=350,
+                xaxis_title="ASIN", yaxis_title="ACoS (%)",
+                plot_bgcolor="white", paper_bgcolor="white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            charts.append(dbc.Col(dcc.Graph(figure=fig_acos), md=12))
+
+    # Chart 2: Spend vs Sales scatter (bubble size = ACoS)
+    if priority_df is not None and not priority_df.empty:
+        chart_df2 = priority_df[priority_df["ASIN"] != ""].copy()
+        if not chart_df2.empty and "合计花费" in chart_df2.columns and "合计销售额" in chart_df2.columns:
+            _spend = chart_df2["合计花费"].apply(_to_float)
+            _sales = chart_df2["合计销售额"].apply(_to_float)
+            _acos2 = chart_df2["综合ACoS"].apply(_to_float) if "综合ACoS" in chart_df2.columns else pd.Series([0]*len(chart_df2))
+            _pri = chart_df2["优先级"].astype(str) if "优先级" in chart_df2.columns else pd.Series([""]*len(chart_df2))
+            _color_map = {"🔴 紧急处理":"#e74c3c","🟡 观察调整":"#f39c12","🟢 增加投入":"#27ae60","⚪ 低优先级":"#bdc3c7"}
+            _colors = [_color_map.get(p, "#95a5a6") for p in _pri]
+
+            fig_scatter = go.Figure()
+            fig_scatter.add_trace(go.Scatter(
+                x=_spend, y=_sales,
+                mode="markers",
+                marker=dict(
+                    size=[max(6, min(a * 3, 40)) for a in _acos2],
+                    color=_colors, opacity=0.7,
+                    line=dict(width=1, color="white"),
+                ),
+                text=[f"{a}<br>ACoS:{ac:.1f}%" for a, ac in zip(chart_df2["ASIN"], _acos2)],
+                hovertemplate="%{text}<br>花费:€%{x:,.0f}<br>销售:€%{y:,.0f}<extra></extra>",
+            ))
+            fig_scatter.update_layout(
+                title="花费 vs 销售额（气泡大小=ACoS）",
+                xaxis_title="花费 (€)", yaxis_title="销售额 (€)",
+                height=400, plot_bgcolor="white", paper_bgcolor="white",
+            )
+            charts.append(dbc.Col(dcc.Graph(figure=fig_scatter), md=12))
+
+    # Chart 3: Product line pie chart
+    if pl_df is not None and not pl_df.empty and "花费(€)" in pl_df.columns:
+        _pl_spend = pl_df["花费(€)"].apply(_to_float)
+        _pl_names = pl_df["品线"].astype(str)
+        if _pl_spend.sum() > 0:
+            fig_pie = go.Figure()
+            fig_pie.add_trace(go.Pie(
+                labels=_pl_names, values=_pl_spend,
+                textinfo="label+percent", hole=0.4,
+            ))
+            fig_pie.update_layout(title="品线花费占比", height=350, paper_bgcolor="white")
+            charts.append(dbc.Col(dcc.Graph(figure=fig_pie), md=6))
+
+        # Sales pie
+        if "销售额(€)" in pl_df.columns:
+            _pl_sales = pl_df["销售额(€)"].apply(_to_float)
+            if _pl_sales.sum() > 0:
+                fig_pie2 = go.Figure()
+                fig_pie2.add_trace(go.Pie(
+                    labels=_pl_names, values=_pl_sales,
+                    textinfo="label+percent", hole=0.4,
+                ))
+                fig_pie2.update_layout(title="品线销售额占比", height=350, paper_bgcolor="white")
+                charts.append(dbc.Col(dcc.Graph(figure=fig_pie2), md=6))
+
+    if charts:
+        sections.append(html.H5("📈 可视化分析", className="mt-4 mb-2"))
+        sections.append(dbc.Row(charts))
+
+    return html.Div(sections)
 
 
 def _build_mode1_tabs(results_dict):
@@ -865,12 +1138,23 @@ def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
         kw_io = _decode_upload(kw_c)
         cfg_io = _decode_upload(cfg_c)
 
+        # Load budget config from Supabase (if saved in config page)
+        budget_config = None
+        try:
+            sb = _get_supabase()
+            cfg_resp = sb.table("analysis_results").select("data").eq("mode", "config").eq("tab_name", "budget_config").order("created_at", desc=True).limit(1).execute()
+            if cfg_resp.data:
+                budget_config = cfg_resp.data[0].get("data", {})
+        except Exception:
+            pass
+
         results = load_and_process(
             campaign_file=campaign_io,
             product_file=product_io,
             search_term_file=st_io,
             keyword_file=kw_io,
             config_file=cfg_io,
+            budget_config=budget_config,
         )
 
         # 标准化 key 映射
@@ -887,7 +1171,7 @@ def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
         _save_results("mode2", results_dict)
 
         # 构建结果 Tab 显示
-        tabs = _build_mode2_tabs(results_dict)
+        tabs = _build_mode2_tabs(results_dict, full_results=results)
         result_card = dbc.Card([
             dbc.CardHeader(html.H5("📈 广告监控分析结果", className="mb-0")),
             dbc.CardBody(dbc.Tabs(tabs)),

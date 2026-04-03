@@ -950,14 +950,366 @@ def get_negatives_df(search_term_df, cfg=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Dashboard 分析引擎
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def classify_priority(asin_row, target_acos):
+    """
+    根据单个 ASIN 的费比/花费/销售情况，返回优先级分类。
+
+    Parameters
+    ----------
+    asin_row : dict-like
+        必须包含 '合计花费', '合计销售额', '综合ACoS' 字段。
+        ACoS 可以是 "12.5%" 格式的字符串或 0.125 的浮点数。
+    target_acos : float
+        目标 ACoS（小数形式，0.04 = 4%）。
+
+    Returns
+    -------
+    dict
+        { "level", "emoji", "label", "reason", "action" }
+    """
+    spend = _safe(asin_row.get("合计花费", 0))
+    sales = _safe(asin_row.get("合计销售额", 0))
+
+    # 解析 ACoS：支持 "12.5%" 字符串或浮点数
+    acos_raw = asin_row.get("综合ACoS", 0)
+    if isinstance(acos_raw, str):
+        acos_raw = acos_raw.strip()
+        if acos_raw in ("-", "", "nan"):
+            acos_val = 0.0
+        elif acos_raw.endswith("%"):
+            acos_val = _safe(acos_raw.replace("%", "")) / 100
+        else:
+            acos_val = _safe(acos_raw)
+    else:
+        acos_val = _safe(acos_raw)
+
+    # ⚪ 低优先级：无花费或极低花费 (< 50€)
+    if spend < 50:
+        return {
+            "level": "gray",
+            "emoji": "⚪",
+            "label": "低优先级",
+            "reason": f"花费仅 {spend:.1f}€，数据量不足以判断" if spend > 0 else "无广告花费",
+            "action": "暂不处理，积累更多数据后再评估",
+        }
+
+    # 🔴 紧急处理：ACoS > target*2.5 且花费 > 500
+    if acos_val > target_acos * 2.5 and spend > 500:
+        return {
+            "level": "red",
+            "emoji": "🔴",
+            "label": "紧急处理",
+            "reason": f"ACoS {acos_val*100:.1f}% 远超目标 {target_acos*100:.1f}%（>{target_acos*2.5*100:.0f}%），花费 {spend:.0f}€",
+            "action": "立即暂停低效广告活动，检查关键词匹配和竞价策略",
+        }
+
+    # 🟡 观察调整：ACoS > target（含 ACoS 在 target ~ target*2.5 之间，或花费 <= 500 的高 ACoS）
+    if acos_val > target_acos:
+        return {
+            "level": "yellow",
+            "emoji": "🟡",
+            "label": "观察调整",
+            "reason": f"ACoS {acos_val*100:.1f}% 超过目标 {target_acos*100:.1f}%，花费 {spend:.0f}€",
+            "action": "降低高ACoS关键词出价，优化广告活动结构",
+        }
+
+    # 🟢 增加投入：ACoS < target 且有销售
+    if acos_val <= target_acos and sales > 0:
+        return {
+            "level": "green",
+            "emoji": "🟢",
+            "label": "增加投入",
+            "reason": f"ACoS {acos_val*100:.1f}% 低于目标 {target_acos*100:.1f}%，利润空间充足",
+            "action": "适当提高预算和出价，扩大广告规模抢占流量",
+        }
+
+    # 默认低优先级（有花费但无销售的边缘情况）
+    return {
+        "level": "gray",
+        "emoji": "⚪",
+        "label": "低优先级",
+        "reason": f"花费 {spend:.0f}€ 但无销售，需检查产品页面和广告设置",
+        "action": "检查 listing 质量、库存状态和广告投放设置",
+    }
+
+
+def get_product_line_suggestions(overview_df, cfg):
+    """
+    按品线汇总费比表现，生成每条品线的优化建议。
+
+    Parameters
+    ----------
+    overview_df : DataFrame
+        费比总览 DataFrame（由 get_overview_df() 返回）。
+    cfg : dict
+        配置字典。
+
+    Returns
+    -------
+    DataFrame
+        列: 品线, ACoS, 目标ACoS, 花费(€), 销售额(€), 花费占比, 销售贡献占比, 建议
+    """
+    if overview_df is None or overview_df.empty:
+        return pd.DataFrame()
+
+    # 排除汇总行
+    df = overview_df[overview_df["品线"] != "全部品线合计"].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # 解析数值列
+    df["_spend"] = df["合计花费"].apply(lambda x: _safe(x))
+    df["_sales"] = df["合计销售额"].apply(lambda x: _safe(x))
+
+    # 按品线聚合
+    pl_grp = df.groupby("品线").agg(
+        spend=("_spend", "sum"),
+        sales=("_sales", "sum"),
+    ).reset_index()
+
+    total_spend = pl_grp["spend"].sum()
+    total_sales = pl_grp["sales"].sum()
+
+    # 为每个品线查找目标 ACoS
+    def _get_pl_target(pl_name):
+        for pl in cfg.get("product_lines", []):
+            if pl["name"] == pl_name:
+                return pl.get("sp_acos", cfg.get("fallback_acos", 0.04))
+        return cfg.get("fallback_acos", 0.04)
+
+    rows = []
+    for _, r in pl_grp.iterrows():
+        pl_name = r["品线"]
+        spend = r["spend"]
+        sales = r["sales"]
+        acos = spend / sales if sales > 0 else 0
+        target = _get_pl_target(pl_name)
+
+        spend_pct = spend / total_spend if total_spend > 0 else 0
+        sales_pct = sales / total_sales if total_sales > 0 else 0
+
+        # 生成建议
+        if acos > target * 2:
+            suggestion = "紧急优化，暂停低效广告活动"
+        elif acos > target:
+            suggestion = "降低高ACoS产品的SP预算，向低ACoS产品倾斜"
+        elif acos > 0:
+            suggestion = "表现良好，可适当增加预算抢量"
+        else:
+            suggestion = "无广告数据，建议开启广告测试"
+
+        rows.append({
+            "品线": pl_name,
+            "ACoS": f"{acos*100:.1f}%",
+            "目标ACoS": f"{target*100:.1f}%",
+            "花费(€)": round(spend, 1),
+            "销售额(€)": round(sales, 1),
+            "花费占比": f"{spend_pct*100:.1f}%",
+            "销售贡献占比": f"{sales_pct*100:.1f}%",
+            "建议": suggestion,
+        })
+
+    col_order = ["品线", "ACoS", "目标ACoS", "花费(€)", "销售额(€)",
+                 "花费占比", "销售贡献占比", "建议"]
+    return pd.DataFrame(rows, columns=col_order)
+
+
+def get_dashboard_data(overview_df, campaigns_df, cfg, budget_config=None):
+    """
+    Generate comprehensive dashboard data from analysis results.
+
+    Parameters
+    ----------
+    overview_df : DataFrame
+        费比总览 DataFrame（由 get_overview_df() 返回）。
+    campaigns_df : DataFrame
+        Campaign 明细 DataFrame（由 get_campaigns_df() 返回）。
+    cfg : dict
+        配置字典。
+    budget_config : dict, optional
+        Budget/target configuration with optional keys:
+        - monthly_budget: float (total ad budget for the month)
+        - monthly_sales_target: float (total sales target)
+        - current_day: int (current day of month)
+        - month_days: int (total days in month, default 30)
+
+    Returns
+    -------
+    dict
+        Comprehensive dashboard data with total metrics, budget progress,
+        sales progress, predictions, priority products, product line
+        summaries, and alerts.
+    """
+    result = {}
+
+    # ── Total metrics ────────────────────────────────────────────────────────
+    # 从 overview_df 的汇总行获取全局数据
+    total_spend = 0.0
+    total_sales = 0.0
+    overall_acos = 0.0
+    total_orders = 0
+
+    if overview_df is not None and not overview_df.empty:
+        summary_mask = overview_df["品线"] == "全部品线合计"
+        if summary_mask.any():
+            summary_row = overview_df[summary_mask].iloc[0]
+            total_spend = _safe(summary_row.get("合计花费", 0))
+            total_sales = _safe(summary_row.get("合计销售额", 0))
+            total_orders = int(_safe(summary_row.get("合计订单", 0)))
+            acos_str = summary_row.get("综合ACoS", "0")
+            if isinstance(acos_str, str) and acos_str.endswith("%"):
+                overall_acos = _safe(acos_str.replace("%", "")) / 100
+            else:
+                overall_acos = _safe(acos_str)
+
+    result["total_spend"] = round(total_spend, 2)
+    result["total_sales"] = round(total_sales, 2)
+    result["overall_acos"] = round(overall_acos, 4)
+    result["total_orders"] = total_orders
+
+    # ── Budget & Sales progress + Predictions ────────────────────────────────
+    if budget_config is not None:
+        monthly_budget = budget_config.get("monthly_budget", 0)
+        monthly_sales_target = budget_config.get("monthly_sales_target", 0)
+        current_day = budget_config.get("current_day", 1)
+        month_days = budget_config.get("month_days", 30)
+        remaining_days = max(month_days - current_day, 0)
+
+        # Budget progress
+        if monthly_budget > 0:
+            budget_spent_pct = round(total_spend / monthly_budget, 4)
+            budget_remaining = round(monthly_budget - total_spend, 2)
+            daily_budget_needed = round(budget_remaining / remaining_days, 2) if remaining_days > 0 else 0.0
+        else:
+            budget_spent_pct = 0.0
+            budget_remaining = 0.0
+            daily_budget_needed = 0.0
+
+        result["budget_spent_pct"] = budget_spent_pct
+        result["budget_remaining"] = budget_remaining
+        result["daily_budget_needed"] = daily_budget_needed
+
+        # Sales progress
+        if monthly_sales_target > 0:
+            sales_completed_pct = round(total_sales / monthly_sales_target, 4)
+            sales_remaining = round(monthly_sales_target - total_sales, 2)
+            daily_sales_needed = round(sales_remaining / remaining_days, 2) if remaining_days > 0 else 0.0
+        else:
+            sales_completed_pct = 0.0
+            sales_remaining = 0.0
+            daily_sales_needed = 0.0
+
+        result["sales_completed_pct"] = sales_completed_pct
+        result["sales_remaining"] = sales_remaining
+        result["daily_sales_needed"] = daily_sales_needed
+
+        # Predictions (linear extrapolation from current pace)
+        if current_day > 0:
+            daily_spend_rate = total_spend / current_day
+            daily_sales_rate = total_sales / current_day
+        else:
+            daily_spend_rate = 0.0
+            daily_sales_rate = 0.0
+
+        predicted_month_end_spend = round(daily_spend_rate * month_days, 2)
+        predicted_month_end_sales = round(daily_sales_rate * month_days, 2)
+
+        result["predicted_month_end_spend"] = predicted_month_end_spend
+        result["predicted_month_end_sales"] = predicted_month_end_sales
+        result["will_overspend"] = predicted_month_end_spend > monthly_budget if monthly_budget > 0 else False
+        result["will_meet_target"] = predicted_month_end_sales >= monthly_sales_target if monthly_sales_target > 0 else False
+
+        # Estimated day budget runs out
+        if daily_spend_rate > 0 and monthly_budget > 0:
+            budget_exhaustion_day = int(monthly_budget / daily_spend_rate)
+            result["budget_exhaustion_day"] = min(budget_exhaustion_day, month_days)
+        else:
+            result["budget_exhaustion_day"] = month_days
+    else:
+        # No budget config — fill with None to indicate not applicable
+        for key in ("budget_spent_pct", "budget_remaining", "daily_budget_needed",
+                     "sales_completed_pct", "sales_remaining", "daily_sales_needed",
+                     "predicted_month_end_spend", "predicted_month_end_sales",
+                     "will_overspend", "will_meet_target", "budget_exhaustion_day"):
+            result[key] = None
+
+    # ── Priority products ────────────────────────────────────────────────────
+    priority_list = []
+    if overview_df is not None and not overview_df.empty:
+        asin_df = overview_df[overview_df["品线"] != "全部品线合计"].copy()
+        for _, row in asin_df.iterrows():
+            asin = row.get("ASIN", "")
+            if not asin or str(asin).strip() == "":
+                continue
+            # 获取该 ASIN 的目标 ACoS
+            asin_info = cfg.get("asins", {}).get(str(asin).upper(), {})
+            if asin_info and asin_info.get("acos_override"):
+                target = asin_info["acos_override"]
+            else:
+                # 使用品线的 SP 目标 ACoS
+                pl_name = row.get("品线", "")
+                target = cfg.get("fallback_acos", 0.04)
+                for pl in cfg.get("product_lines", []):
+                    if pl["name"] == pl_name:
+                        target = pl.get("sp_acos", cfg.get("fallback_acos", 0.04))
+                        break
+
+            priority = classify_priority(row, target)
+            priority_list.append({
+                "ASIN": asin,
+                "产品名称": row.get("产品名称", asin),
+                "品线": row.get("品线", ""),
+                "合计花费": _safe(row.get("合计花费", 0)),
+                "合计销售额": _safe(row.get("合计销售额", 0)),
+                "综合ACoS": row.get("综合ACoS", "-"),
+                "目标ACoS": f"{target*100:.1f}%",
+                "priority_level": priority["level"],
+                "priority_emoji": priority["emoji"],
+                "priority_label": priority["label"],
+                "priority_reason": priority["reason"],
+                "priority_action": priority["action"],
+            })
+
+    result["priority_products"] = priority_list
+
+    # ── Product line summaries ───────────────────────────────────────────────
+    pl_suggestions = get_product_line_suggestions(overview_df, cfg)
+    result["product_line_summaries"] = pl_suggestions.to_dict("records") if not pl_suggestions.empty else []
+
+    # ── Alerts: products with ACoS > 15% ─────────────────────────────────────
+    alerts = []
+    for item in priority_list:
+        acos_str = item.get("综合ACoS", "-")
+        if isinstance(acos_str, str) and acos_str.endswith("%"):
+            acos_val = _safe(acos_str.replace("%", "")) / 100
+        else:
+            acos_val = _safe(acos_str)
+        if acos_val > 0.15:
+            alerts.append({
+                "ASIN": item["ASIN"],
+                "产品名称": item["产品名称"],
+                "品线": item["品线"],
+                "ACoS": acos_str,
+                "花费": item["合计花费"],
+                "priority": item["priority_label"],
+            })
+    result["alerts"] = alerts
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 一站式入口
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_and_process(campaign_file, product_file,
                      search_term_file=None, keyword_file=None,
-                     config_file=None):
+                     config_file=None, budget_config=None):
     """
-    一站式加载所有报告并生成4个 DataFrame。
+    一站式加载所有报告并生成全部分析 DataFrame 和 Dashboard 数据。
 
     Parameters
     ----------
@@ -972,15 +1324,24 @@ def load_and_process(campaign_file, product_file,
     config_file : str 或 BytesIO, optional
         广告配置.xlsx。如果是字符串且为目录，在其中查找 "广告配置.xlsx"。
         如果为 None，则使用 campaign_file 所在目录查找（仅当 campaign_file 是路径时）。
+    budget_config : dict, optional
+        Budget/target configuration with optional keys:
+        - monthly_budget: float (total ad budget for the month)
+        - monthly_sales_target: float (total sales target)
+        - current_day: int (current day of month)
+        - month_days: int (total days in month, default 30)
 
     Returns
     -------
     dict
         {
-            "overview":  DataFrame,   # 费比总览
-            "campaigns": DataFrame,   # Campaign 明细
-            "keywords":  DataFrame,   # 关键词 ROI 分析
-            "negatives": DataFrame,   # 建议否定词
+            "overview":       DataFrame,   # 费比总览
+            "campaigns":      DataFrame,   # Campaign 明细
+            "keywords":       DataFrame,   # 关键词 ROI 分析
+            "negatives":      DataFrame,   # 建议否定词
+            "dashboard":      dict,        # Dashboard 综合数据
+            "priority":       DataFrame,   # ASIN 优先级分类
+            "pl_suggestions": DataFrame,   # 品线优化建议
         }
     """
     # 加载配置
@@ -1012,9 +1373,31 @@ def load_and_process(campaign_file, product_file,
     keywords_df  = get_keywords_df(kw_df, cfg)
     negatives_df = get_negatives_df(st_df, cfg)
 
+    # Dashboard 分析
+    dashboard_data = get_dashboard_data(overview_df, campaigns_df, cfg, budget_config)
+
+    # Priority DataFrame（从 dashboard 的 priority_products 列表构建）
+    priority_list = dashboard_data.get("priority_products", [])
+    if priority_list:
+        priority_df = pd.DataFrame(priority_list)
+        # 按优先级排序：red > yellow > green > gray
+        level_order = {"red": 0, "yellow": 1, "green": 2, "gray": 3}
+        priority_df["_sort"] = priority_df["priority_level"].map(level_order)
+        priority_df = priority_df.sort_values(
+            ["_sort", "合计花费"], ascending=[True, False]
+        ).drop(columns=["_sort"]).reset_index(drop=True)
+    else:
+        priority_df = pd.DataFrame()
+
+    # Product line suggestions DataFrame
+    pl_suggestions_df = get_product_line_suggestions(overview_df, cfg)
+
     return {
-        "overview":  overview_df,
-        "campaigns": campaigns_df,
-        "keywords":  keywords_df,
-        "negatives": negatives_df,
+        "overview":       overview_df,
+        "campaigns":      campaigns_df,
+        "keywords":       keywords_df,
+        "negatives":      negatives_df,
+        "dashboard":      dashboard_data,
+        "priority":       priority_df,
+        "pl_suggestions": pl_suggestions_df,
     }

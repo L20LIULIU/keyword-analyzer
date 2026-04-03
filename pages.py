@@ -382,6 +382,68 @@ def config_page():
             ]),
         ], className="mb-4"),
 
+        # ── Section A2: 月度预算与目标 ──────────────────────────
+        dbc.Card([
+            dbc.CardHeader(html.H5("💰 月度预算 & 销量目标", className="mb-0")),
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("月度广告总预算 (€)", html_for="cfg-monthly-budget"),
+                        dbc.Input(
+                            id="cfg-monthly-budget",
+                            type="number",
+                            value=0,
+                            min=0,
+                            step=100,
+                            placeholder="如 100000",
+                        ),
+                        dbc.FormText("当月广告花费预算总额"),
+                    ], md=3),
+                    dbc.Col([
+                        dbc.Label("月度广告销售目标 (€)", html_for="cfg-monthly-sales-target"),
+                        dbc.Input(
+                            id="cfg-monthly-sales-target",
+                            type="number",
+                            value=0,
+                            min=0,
+                            step=1000,
+                            placeholder="如 1200000",
+                        ),
+                        dbc.FormText("当月广告销售额目标"),
+                    ], md=3),
+                    dbc.Col([
+                        dbc.Label("当前日期 (月内第几天)", html_for="cfg-current-day"),
+                        dbc.Input(
+                            id="cfg-current-day",
+                            type="number",
+                            value=1,
+                            min=1,
+                            max=31,
+                        ),
+                        dbc.FormText("报告截止到当月第几天"),
+                    ], md=3),
+                    dbc.Col([
+                        dbc.Label("目标ACoS (%)", html_for="cfg-target-acos"),
+                        dbc.Input(
+                            id="cfg-target-acos",
+                            type="number",
+                            value=4.0,
+                            min=0,
+                            max=100,
+                            step=0.1,
+                        ),
+                        dbc.FormText("综合目标ACoS百分比"),
+                    ], md=3),
+                ]),
+                html.Hr(),
+                dbc.Button(
+                    "💾 保存预算配置", id="btn-save-budget", color="primary",
+                    className="me-2",
+                ),
+                html.Span(id="budget-save-status"),
+            ]),
+        ], className="mb-4"),
+
         # ── Section B: 产品列表 ──────────────────────────────
         dbc.Card([
             dbc.CardHeader(
@@ -757,3 +819,46 @@ def save_config(n_clicks, products, month_days, tacos_target,
             color="danger",
             duration=6000,
         )
+
+
+# ── 保存预算配置回调 ─────────────────────────────────────────────
+@callback(
+    Output("budget-save-status", "children"),
+    Input("btn-save-budget", "n_clicks"),
+    State("cfg-monthly-budget", "value"),
+    State("cfg-monthly-sales-target", "value"),
+    State("cfg-current-day", "value"),
+    State("cfg-target-acos", "value"),
+    State("cfg-global-month-days", "value"),
+    prevent_initial_call=True,
+)
+def save_budget_config(n_clicks, monthly_budget, monthly_sales_target,
+                       current_day, target_acos, month_days):
+    if not n_clicks:
+        return dash.no_update
+
+    budget_cfg = {
+        "monthly_budget": float(monthly_budget or 0),
+        "monthly_sales_target": float(monthly_sales_target or 0),
+        "current_day": int(current_day or 1),
+        "month_days": int(month_days or 30),
+        "target_acos": float(target_acos or 4.0) / 100,  # 转为小数
+    }
+
+    try:
+        sb = _get_sb()
+        now = datetime.utcnow().isoformat()
+        sb.table("analysis_results").insert({
+            "mode": "config",
+            "tab_name": "budget_config",
+            "data": budget_cfg,
+            "created_at": now,
+        }).execute()
+        return dbc.Alert(
+            f"✅ 预算配置已保存 (预算€{budget_cfg['monthly_budget']:,.0f} / "
+            f"目标€{budget_cfg['monthly_sales_target']:,.0f} / "
+            f"ACoS {target_acos}%)",
+            color="success", duration=4000,
+        )
+    except Exception as e:
+        return dbc.Alert(f"❌ 保存失败: {e}", color="danger", duration=6000)
