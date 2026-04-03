@@ -60,6 +60,11 @@ LINGXING_COL_MAP = {
     "间接订单":       "indirect_orders",
     "CVR":            "cvr",
     "广告销量":       "ad_units",
+    # 广告位报告 / 扩展字段
+    "广告位":         "placement",        # 广告位位置
+    "IS":             "impression_share",  # 曝光份额
+    "品牌新客订单":   "ntb_orders",
+    "品牌新客销售额-本币": "ntb_sales",
 }
 
 # DJI 品牌词根（用于否定词检测）
@@ -394,6 +399,24 @@ def load_search_term_report(source):
     df = _detect_type_from_col(df)
     df = _numerify(df, ["spend", "ad_sales", "impressions", "clicks", "orders", "cpc"])
     df = _pctify(df,  ["acos"])
+    df = _clean_df(df, "campaign")
+    return df
+
+
+def load_placement_report(source):
+    """Load Lingxing placement report (广告位报告)."""
+    df = _read_lingxing(source)
+    if df.empty:
+        return df
+    df = _detect_type_from_col(df)
+    # Numerify
+    for c in ["spend", "ad_sales", "direct_sales", "indirect_sales",
+              "impressions", "clicks", "orders", "cpc"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_safe)
+    for c in ["acos", "ctr", "cvr"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_pct)
     df = _clean_df(df, "campaign")
     return df
 
@@ -742,7 +765,13 @@ def get_keywords_df(kw_df, cfg):
 
     # 聚合（同一个关键词可能出现在多个活动/组）
     kw_col = "keyword" if "keyword" in kw_df.columns else kw_df.columns[0]
-    grp = kw_df.groupby([kw_col]).agg(
+    has_match_type = "match_type" in kw_df.columns
+
+    group_cols = [kw_col]
+    if has_match_type:
+        group_cols.append("match_type")
+
+    grp = kw_df.groupby(group_cols).agg(
         spend       = ("spend",       "sum"),
         ad_sales    = ("ad_sales",    "sum"),
         clicks      = ("clicks",      "sum"),
@@ -825,7 +854,7 @@ def get_keywords_df(kw_df, cfg):
     rows = []
     for _, r in grp.iterrows():
         ac = r["acos"]
-        rows.append({
+        row_data = {
             "关键词":           str(r["keyword"]),
             f"花费({cur})":     round(r["spend"], 2),
             f"广告收入({cur})":  round(r["ad_sales"], 2),
@@ -837,10 +866,15 @@ def get_keywords_df(kw_df, cfg):
             f"CPC({cur})":      round(r["cpc"], 2) if r["cpc"] > 0 else "-",
             "建议出价":         r["建议出价"],
             "建议动作":         r["建议动作"],
-        })
+        }
+        if has_match_type:
+            row_data["匹配方式"] = str(r.get("match_type", ""))
+        rows.append(row_data)
 
-    col_order = [
-        "关键词",
+    col_order = ["关键词"]
+    if has_match_type:
+        col_order.append("匹配方式")
+    col_order += [
         f"花费({cur})", f"广告收入({cur})", "ACoS", "ROAS",
         "点击", "转化", "CVR", f"CPC({cur})",
         "建议出价", "建议动作",
@@ -856,8 +890,15 @@ def build_negatives(st_df, cfg):
     """
     从用户搜索词报告中提取建议否定词 DataFrame。
 
-    条件1: ACoS > 100%（30天数据）
-    条件2: 包含DJI变体写法（错写/空格/错序）
+    否定候选条件（必须 spend > 3€）：
+    1. 高点击零转化: clicks >= 8 且 orders == 0 → 精准否定
+    2. 极高费比: ACoS > target*5 且 spend > 10 → 精准否定
+    3. 高费比: ACoS > target*3 且 spend > 20 → 词组否定
+    4. 竞品品牌词: 搜索词包含竞品品牌名 → 精准否定
+    5. DJI拼写变体: DJI错写/错序（排除精确的 "dji"）→ 精准否定
+
+    排除：spend < 3€ 的词；orders > 0 且 ACoS < target*2 的词；
+    精确搜索词 "dji"。
 
     Parameters
     ----------
@@ -869,10 +910,19 @@ def build_negatives(st_df, cfg):
     Returns
     -------
     DataFrame
-        列: 否定搜索词, 否定原因, 花费, 广告收入, ACoS, 点击, 订单, 建议否定类型, 操作
+        列: 否定搜索词, 否定原因, 花费, 广告收入, ACoS, 点击, 订单,
+            建议否定类型, 操作
     """
     if st_df is None or st_df.empty:
         return pd.DataFrame()
+
+    target = cfg.get("fallback_acos", 0.04)
+
+    # Competitor brand patterns (common DJI competitors)
+    COMPETITOR_BRANDS = [
+        r"\bgopro\b", r"\binsta\s*360\b", r"\bfimi\b", r"\bhubsan\b",
+        r"\bholy\s*stone\b", r"\bpotensic\b", r"\bruko\b",
+    ]
 
     # 聚合
     st_col = "search_term" if "search_term" in st_df.columns else st_df.columns[0]
@@ -885,36 +935,69 @@ def build_negatives(st_df, cfg):
     grp.rename(columns={st_col: "search_term"}, inplace=True)
 
     grp["acos"] = grp.apply(
-        lambda r: r["spend"] / r["ad_sales"] if r["ad_sales"] > 0 else 999, axis=1)
+        lambda r: r["spend"] / r["ad_sales"] if r["ad_sales"] > 0 else 0, axis=1)
 
     results = []
     for _, r in grp.iterrows():
         term   = str(r["search_term"]).strip()
         acos   = r["acos"]
         spend  = r["spend"]
-        orders = r["orders"]
-        clicks = r["clicks"]
+        orders = int(r["orders"])
+        clicks = int(r["clicks"])
+        t_lower = term.lower()
 
-        reasons = []
+        # Skip: too little data
+        if spend < 3:
+            continue
 
-        # 条件1: ACoS > 100% 且有实际花费
-        if acos > 1.0 and spend > 0:
-            reasons.append(f"ACoS {acos*100:.0f}%（>100%）")
+        # Skip: converting reasonably well
+        if orders > 0 and acos < target * 2:
+            continue
 
-        # 条件2: DJI变体写法
-        if is_dji_misspell(term) and term.lower() != "dji":
-            reasons.append("DJI错写/错序变体")
+        # Skip: the exact brand keyword "dji"
+        if t_lower == "dji":
+            continue
 
-        if reasons:
+        neg_type = None
+        reason = None
+
+        # 1. HIGH CLICKS NO CONVERSION
+        if clicks >= 8 and orders == 0:
+            neg_type = "精准否定"
+            reason = f"高点击零转化({clicks}次点击)"
+
+        # 2. EXTREME ACOS
+        elif acos > target * 5 and spend > 10:
+            neg_type = "精准否定"
+            reason = f"极高费比(ACoS {acos*100:.1f}%)"
+
+        # 3. HIGH ACOS
+        elif acos > target * 3 and spend > 20:
+            neg_type = "词组否定"
+            reason = f"高费比(ACoS {acos*100:.1f}%)"
+
+        # 4. COMPETITOR BRAND TERMS
+        elif any(re.search(p, t_lower) for p in COMPETITOR_BRANDS):
+            neg_type = "精准否定"
+            reason = "竞品品牌词"
+
+        # 5. DJI MISSPELLS (exclude exact "dji", already handled above)
+        elif is_dji_misspell(term):
+            neg_type = "精准否定"
+            reason = "品牌拼写变体"
+
+        if neg_type:
+            acos_display = f"{acos*100:.1f}%" if 0 < acos < 10 else (
+                ">1000%" if acos >= 10 else "-")
             results.append({
                 "否定搜索词":     term,
-                "否定原因":       " + ".join(reasons),
+                "否定原因":       reason,
                 "花费":           round(spend, 2),
                 "广告收入":       round(r["ad_sales"], 2),
-                "ACoS":           f"{acos*100:.0f}%" if acos < 10 else ">1000%",
-                "点击":           int(clicks),
-                "订单":           int(orders),
-                "建议否定类型":   "精准否定（Exact）",
+                "ACoS":           acos_display,
+                "点击":           clicks,
+                "订单":           orders,
+                "建议否定类型":   neg_type,
                 "操作":           "复制「否定搜索词」列到领星 → 批量添加否定关键词",
             })
 
@@ -922,10 +1005,9 @@ def build_negatives(st_df, cfg):
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-    # ACoS > 100% 优先，然后DJI变体
-    df["_sort"] = df["否定原因"].apply(lambda x: 0 if "ACoS" in x else 1)
-    df = df.sort_values(["_sort", "花费"], ascending=[True, False]).drop(columns=["_sort"])
-    return df.reset_index(drop=True)
+    # Sort: high-spend problems first
+    df = df.sort_values("花费", ascending=False).reset_index(drop=True)
+    return df
 
 
 def get_negatives_df(search_term_df, cfg=None):
@@ -947,6 +1029,280 @@ def get_negatives_df(search_term_df, cfg=None):
     if cfg is None:
         cfg = {"product_lines": [], "asins": {}, "fallback_acos": 0.04}
     return build_negatives(search_term_df, cfg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 广告位分析 → get_placement_df
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_placement_df(placement_df, cfg):
+    """
+    生成广告位分析 DataFrame，展示各广告位的表现和优化建议。
+
+    Parameters
+    ----------
+    placement_df : DataFrame
+        广告位报告，由 load_placement_report() 返回。
+    cfg : dict
+        配置字典，由 load_config() 返回。
+
+    Returns
+    -------
+    DataFrame
+        列: 广告位, 广告活动, 花费(€), 销售额(€), ACoS, 目标ACoS,
+            ROAS, 点击, 订单, CVR, CPC(€), 建议
+    """
+    if placement_df is None or placement_df.empty:
+        return pd.DataFrame()
+
+    df = placement_df.copy()
+    for col in ["spend", "ad_sales", "clicks", "orders", "impressions"]:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # ── Per-campaign per-placement aggregation ────────────────────────────────
+    placement_col = "placement" if "placement" in df.columns else None
+    if placement_col is None:
+        return pd.DataFrame({"错误": ["广告位报告缺少 placement 列"]})
+
+    grp = df.groupby(["campaign", placement_col]).agg(
+        spend       = ("spend",       "sum"),
+        ad_sales    = ("ad_sales",    "sum"),
+        clicks      = ("clicks",      "sum"),
+        orders      = ("orders",      "sum"),
+        impressions = ("impressions", "sum"),
+    ).reset_index()
+
+    # Derived metrics
+    grp["acos"] = grp.apply(
+        lambda r: r["spend"] / r["ad_sales"] if r["ad_sales"] > 0 else 0, axis=1)
+    grp["cpc"] = grp.apply(
+        lambda r: r["spend"] / r["clicks"] if r["clicks"] > 0 else 0, axis=1)
+    grp["cvr"] = grp.apply(
+        lambda r: r["orders"] / r["clicks"] if r["clicks"] > 0 else 0, axis=1)
+    grp["roas"] = grp.apply(
+        lambda r: r["ad_sales"] / r["spend"] if r["spend"] > 0 else 0, axis=1)
+    grp["ctr"] = grp.apply(
+        lambda r: r["clicks"] / r["impressions"] if r["impressions"] > 0 else 0, axis=1)
+
+    # ── Summary section: grouped by placement only ────────────────────────────
+    summary = df.groupby(placement_col).agg(
+        spend       = ("spend",       "sum"),
+        ad_sales    = ("ad_sales",    "sum"),
+        clicks      = ("clicks",      "sum"),
+        orders      = ("orders",      "sum"),
+        impressions = ("impressions", "sum"),
+    ).reset_index()
+
+    summary["acos"] = summary.apply(
+        lambda r: r["spend"] / r["ad_sales"] if r["ad_sales"] > 0 else 0, axis=1)
+    summary["cpc"] = summary.apply(
+        lambda r: r["spend"] / r["clicks"] if r["clicks"] > 0 else 0, axis=1)
+    summary["cvr"] = summary.apply(
+        lambda r: r["orders"] / r["clicks"] if r["clicks"] > 0 else 0, axis=1)
+    summary["roas"] = summary.apply(
+        lambda r: r["ad_sales"] / r["spend"] if r["spend"] > 0 else 0, axis=1)
+    summary["ctr"] = summary.apply(
+        lambda r: r["clicks"] / r["impressions"] if r["impressions"] > 0 else 0, axis=1)
+
+    # ── Build suggestion logic ────────────────────────────────────────────────
+    fallback = cfg.get("fallback_acos", 0.04)
+
+    def _placement_suggestion(acos, cvr, ctr, spend, target):
+        if acos > target * 2 and spend > 10:
+            return "降低竞价调整"
+        if acos > 0 and acos < target and cvr > 0.05:
+            return "可提高竞价抢量"
+        if ctr < 0.002 and spend > 5:
+            return "检查广告素材"
+        return "正常"
+
+    # ── Build output rows (summary first, then detail) ────────────────────────
+    rows = []
+
+    # Summary rows
+    for _, r in summary.iterrows():
+        pl_name = str(r[placement_col])
+        target = fallback
+        suggestion = _placement_suggestion(
+            r["acos"], r["cvr"], r["ctr"], r["spend"], target)
+        rows.append({
+            "广告位":    f"【汇总】{pl_name}",
+            "广告活动":  "",
+            "花费(€)":   round(r["spend"], 2),
+            "销售额(€)": round(r["ad_sales"], 2),
+            "ACoS":      f"{r['acos']*100:.1f}%" if r["spend"] > 0 else "-",
+            "目标ACoS":  f"{target*100:.1f}%",
+            "ROAS":      round(r["roas"], 2) if r["spend"] > 0 else "-",
+            "点击":      int(r["clicks"]),
+            "订单":      int(r["orders"]),
+            "CVR":       f"{r['cvr']*100:.1f}%" if r["clicks"] > 0 else "-",
+            "CPC(€)":    round(r["cpc"], 2) if r["clicks"] > 0 else "-",
+            "建议":      suggestion,
+        })
+
+    # Detail rows (per campaign × placement)
+    grp = grp.sort_values(["spend"], ascending=False)
+    for _, r in grp.iterrows():
+        campaign = str(r["campaign"])
+        pl_name = str(r[placement_col])
+        ad_type = detect_ad_type(campaign)
+        target = get_target_acos(cfg, campaign, ad_type)
+        suggestion = _placement_suggestion(
+            r["acos"], r["cvr"], r["ctr"], r["spend"], target)
+        rows.append({
+            "广告位":    pl_name,
+            "广告活动":  campaign,
+            "花费(€)":   round(r["spend"], 2),
+            "销售额(€)": round(r["ad_sales"], 2),
+            "ACoS":      f"{r['acos']*100:.1f}%" if r["spend"] > 0 else "-",
+            "目标ACoS":  f"{target*100:.1f}%",
+            "ROAS":      round(r["roas"], 2) if r["spend"] > 0 else "-",
+            "点击":      int(r["clicks"]),
+            "订单":      int(r["orders"]),
+            "CVR":       f"{r['cvr']*100:.1f}%" if r["clicks"] > 0 else "-",
+            "CPC(€)":    round(r["cpc"], 2) if r["clicks"] > 0 else "-",
+            "建议":      suggestion,
+        })
+
+    col_order = [
+        "广告位", "广告活动", "花费(€)", "销售额(€)", "ACoS", "目标ACoS",
+        "ROAS", "点击", "订单", "CVR", "CPC(€)", "建议",
+    ]
+    return pd.DataFrame(rows, columns=col_order)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 自动投放优化分析 → get_auto_targeting_df
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_auto_targeting_df(st_df, cfg):
+    """
+    从搜索词报告中提取自动投放搜索词，分析并给出操作建议。
+
+    筛选条件：match_type 为 "--" 或空，且 targeting 为自动投放类型
+    （同类商品/紧密匹配/宽泛匹配）。
+
+    Parameters
+    ----------
+    st_df : DataFrame
+        搜索词报告，由 load_search_term_report() 返回。
+    cfg : dict
+        配置字典，由 load_config() 返回。
+
+    Returns
+    -------
+    DataFrame
+        列: 搜索词, 投放类型, 花费(€), 销售额(€), ACoS, 点击, 订单, CVR,
+            建议操作, 操作原因
+    """
+    if st_df is None or st_df.empty:
+        return pd.DataFrame()
+
+    AUTO_TYPES = {"同类商品", "紧密匹配", "宽泛匹配"}
+
+    df = st_df.copy()
+
+    # Filter: auto-targeting rows
+    has_match = "match_type" in df.columns
+    has_targeting = "targeting" in df.columns
+    if not has_targeting:
+        return pd.DataFrame()
+
+    # match_type is "--" or empty → auto targeting
+    if has_match:
+        match_mask = df["match_type"].astype(str).str.strip().isin(["--", "", "nan"])
+    else:
+        match_mask = pd.Series(True, index=df.index)
+
+    targeting_mask = df["targeting"].astype(str).str.strip().isin(AUTO_TYPES)
+    auto_df = df[match_mask & targeting_mask].copy()
+
+    if auto_df.empty:
+        return pd.DataFrame()
+
+    # Ensure numeric columns
+    for col in ["spend", "ad_sales", "clicks", "orders"]:
+        if col not in auto_df.columns:
+            auto_df[col] = 0.0
+
+    st_col = "search_term" if "search_term" in auto_df.columns else auto_df.columns[0]
+
+    # Preserve targeting type per search term (take first occurrence)
+    targeting_map = auto_df.groupby(st_col)["targeting"].first()
+
+    # Aggregate by search term
+    grp = auto_df.groupby(st_col).agg(
+        spend    = ("spend",    "sum"),
+        ad_sales = ("ad_sales", "sum"),
+        clicks   = ("clicks",   "sum"),
+        orders   = ("orders",   "sum"),
+    ).reset_index()
+    grp.rename(columns={st_col: "search_term"}, inplace=True)
+
+    grp["targeting_type"] = grp["search_term"].map(targeting_map)
+    grp["acos"] = grp.apply(
+        lambda r: r["spend"] / r["ad_sales"] if r["ad_sales"] > 0 else 0, axis=1)
+    grp["cvr"] = grp.apply(
+        lambda r: r["orders"] / r["clicks"] if r["clicks"] > 0 else 0, axis=1)
+
+    fallback = cfg.get("fallback_acos", 0.04)
+
+    # Classify each search term
+    def _classify(r):
+        orders = r["orders"]
+        clicks = r["clicks"]
+        acos = r["acos"]
+        spend = r["spend"]
+        target = fallback
+
+        if orders >= 2 and acos <= target:
+            return "转手动精准", f"已转化{int(orders)}单，ACoS {acos*100:.1f}%≤目标{target*100:.1f}%"
+        if orders >= 1 and acos <= target * 1.5:
+            return "转手动广泛", f"已转化{int(orders)}单，ACoS {acos*100:.1f}%有潜力"
+        if clicks >= 10 and orders == 0:
+            return "否定精准", f"高点击({int(clicks)}次)零转化，浪费花费{spend:.1f}€"
+        if acos > target * 3 and spend > 5:
+            return "否定词组", f"极高ACoS {acos*100:.1f}%，花费{spend:.1f}€"
+        return "继续观察", "数据不足或表现中等，继续积累数据"
+
+    grp[["action", "reason"]] = grp.apply(
+        lambda r: pd.Series(_classify(r)), axis=1)
+
+    # Sort: 转手动精准 first, then 否定精准, then rest
+    action_order = {
+        "转手动精准": 0,
+        "转手动广泛": 1,
+        "否定精准":   2,
+        "否定词组":   3,
+        "继续观察":   4,
+    }
+    grp["_sort"] = grp["action"].map(action_order)
+    grp = grp.sort_values(
+        ["_sort", "spend"], ascending=[True, False]
+    ).drop(columns=["_sort"]).reset_index(drop=True)
+
+    # Build output
+    rows = []
+    for _, r in grp.iterrows():
+        rows.append({
+            "搜索词":    str(r["search_term"]),
+            "投放类型":  str(r["targeting_type"]),
+            "花费(€)":   round(r["spend"], 2),
+            "销售额(€)": round(r["ad_sales"], 2),
+            "ACoS":      f"{r['acos']*100:.1f}%" if r["acos"] > 0 else "-",
+            "点击":      int(r["clicks"]),
+            "订单":      int(r["orders"]),
+            "CVR":       f"{r['cvr']*100:.1f}%" if r["cvr"] > 0 else "-",
+            "建议操作":  r["action"],
+            "操作原因":  r["reason"],
+        })
+
+    col_order = [
+        "搜索词", "投放类型", "花费(€)", "销售额(€)", "ACoS",
+        "点击", "订单", "CVR", "建议操作", "操作原因",
+    ]
+    return pd.DataFrame(rows, columns=col_order)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1307,7 +1663,8 @@ def get_dashboard_data(overview_df, campaigns_df, cfg, budget_config=None):
 
 def load_and_process(campaign_file, product_file,
                      search_term_file=None, keyword_file=None,
-                     config_file=None, budget_config=None):
+                     config_file=None, budget_config=None,
+                     placement_file=None):
     """
     一站式加载所有报告并生成全部分析 DataFrame 和 Dashboard 数据。
 
@@ -1330,6 +1687,8 @@ def load_and_process(campaign_file, product_file,
         - monthly_sales_target: float (total sales target)
         - current_day: int (current day of month)
         - month_days: int (total days in month, default 30)
+    placement_file : str 或 BytesIO, optional
+        领星广告位报告。
 
     Returns
     -------
@@ -1342,6 +1701,8 @@ def load_and_process(campaign_file, product_file,
             "dashboard":      dict,        # Dashboard 综合数据
             "priority":       DataFrame,   # ASIN 优先级分类
             "pl_suggestions": DataFrame,   # 品线优化建议
+            "placements":     DataFrame,   # 广告位分析
+            "auto_targeting": DataFrame,   # 自动投放优化
         }
     """
     # 加载配置
@@ -1367,11 +1728,22 @@ def load_and_process(campaign_file, product_file,
         if isinstance(keyword_file, BytesIO) or (isinstance(keyword_file, str) and os.path.isfile(keyword_file)):
             kw_df = load_search_term_report(keyword_file)  # 列结构相似
 
+    plc_df = None
+    if placement_file is not None:
+        if isinstance(placement_file, BytesIO) or (isinstance(placement_file, str) and os.path.isfile(placement_file)):
+            plc_df = load_placement_report(placement_file)
+
     # 生成各 DataFrame
     overview_df  = get_overview_df(prod_df, cfg)
     campaigns_df = get_campaigns_df(camp_df, cfg)
     keywords_df  = get_keywords_df(kw_df, cfg)
     negatives_df = get_negatives_df(st_df, cfg)
+
+    # 广告位分析
+    placement_result_df = get_placement_df(plc_df, cfg) if plc_df is not None else pd.DataFrame()
+
+    # 自动投放优化（从搜索词报告中提取）
+    auto_targeting_df = get_auto_targeting_df(st_df, cfg) if st_df is not None else pd.DataFrame()
 
     # Dashboard 分析
     dashboard_data = get_dashboard_data(overview_df, campaigns_df, cfg, budget_config)
@@ -1400,4 +1772,6 @@ def load_and_process(campaign_file, product_file,
         "dashboard":      dashboard_data,
         "priority":       priority_df,
         "pl_suggestions": pl_suggestions_df,
+        "placements":     placement_result_df,
+        "auto_targeting": auto_targeting_df,
     }

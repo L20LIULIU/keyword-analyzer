@@ -282,7 +282,7 @@ def _render_datatable(df, header_color="#2C3E50", page_size=30, freeze_cols=0):
 def _build_mode2_tabs(results_dict, full_results=None):
     """
     从 results_dict {tab_name: DataFrame} 构建模式2 Tab 列表。
-    tab_order 固定为 4 个标签页。
+    tab_order 固定为 6 个标签页。
     """
     tabs = []
 
@@ -294,7 +294,7 @@ def _build_mode2_tabs(results_dict, full_results=None):
             children=[dashboard_content],
         ))
 
-    tab_order = ["费比总览", "Campaign明细", "关键词ROI分析", "建议否定词"]
+    tab_order = ["费比总览", "Campaign明细", "广告位分析", "关键词ROI分析", "自动投放优化", "建议否定词"]
     for label in tab_order:
         df = results_dict.get(label)
         if df is not None and not df.empty:
@@ -754,6 +754,21 @@ mode2_upload_collapse = dbc.Card([
                     html.Div(id="keyword-filename", className="text-success mt-1 small"),
                 ], md=3),
             ]),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("广告位报告", className="fw-bold"),
+                    dcc.Upload(
+                        id="upload-placement",
+                        children=html.Div(["拖放或 ", html.A("选择文件", className="text-primary")]),
+                        style={
+                            "borderWidth": "1px", "borderStyle": "dashed",
+                            "borderRadius": "8px", "textAlign": "center",
+                            "padding": "20px", "borderColor": "#ccc",
+                        },
+                    ),
+                    html.Small(id="placement-filename", className="text-muted"),
+                ], md=6),
+            ], className="mt-2"),
             html.Hr(),
             dbc.Row([
                 dbc.Col([
@@ -1083,6 +1098,7 @@ for upload_id, display_id in [
     ("upload-product", "product-filename"),
     ("upload-searchterm", "searchterm-filename"),
     ("upload-keyword", "keyword-filename"),
+    ("upload-placement", "placement-filename"),
     ("upload-own", "own-filename"),
 ]:
     @callback(Output(display_id, "children"),
@@ -1120,10 +1136,11 @@ def _decode_upload(contents):
     State("upload-product", "contents"),
     State("upload-searchterm", "contents"),
     State("upload-keyword", "contents"),
+    State("upload-placement", "contents"),
     State("upload-adconfig", "contents"),
     prevent_initial_call=True,
 )
-def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
+def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, placement_c, cfg_c):
     if not campaign_c or not product_c:
         return dash.no_update, dbc.Alert(
             "请上传广告活动报告和推广商品报告", color="warning",
@@ -1136,6 +1153,7 @@ def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
         product_io = _decode_upload(product_c)
         st_io = _decode_upload(st_c)
         kw_io = _decode_upload(kw_c)
+        placement_io = _decode_upload(placement_c)
         cfg_io = _decode_upload(cfg_c)
 
         # Load budget config from Supabase (if saved in config page)
@@ -1153,6 +1171,7 @@ def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
             product_file=product_io,
             search_term_file=st_io,
             keyword_file=kw_io,
+            placement_file=placement_io,
             config_file=cfg_io,
             budget_config=budget_config,
         )
@@ -1161,7 +1180,9 @@ def run_mode2(n_clicks, campaign_c, product_c, st_c, kw_c, cfg_c):
         results_dict = {
             "费比总览": results.get("overview"),
             "Campaign明细": results.get("campaigns"),
+            "广告位分析": results.get("placements"),
             "关键词ROI分析": results.get("keywords"),
+            "自动投放优化": results.get("auto_targeting"),
             "建议否定词": results.get("negatives"),
         }
         # 过滤掉 None
